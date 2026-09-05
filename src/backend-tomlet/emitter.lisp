@@ -1,0 +1,172 @@
+(in-package #:toml-backend-tomlet)
+
+(defun %bare-key-p (key)
+  (and (plusp (length key))
+       (every (lambda (c)
+                (or (alphanumericp c) (char= c #\_) (char= c #\-)))
+              key)))
+
+(defun %emit-escaped (string stream)
+  (loop for c across string
+        do (case c
+             (#\" (write-string "\\\"" stream))
+             (#\\ (write-string "\\\\" stream))
+             (#\Newline (write-string "\\n" stream))
+             (#\Return (write-string "\\r" stream))
+             (#\Tab (write-string "\\t" stream))
+             (t (write-char c stream)))))
+
+(defun %emit-key (key stream)
+  (let ((s (if (stringp key) key (string-downcase (string key)))))
+    (if (%bare-key-p s)
+        (write-string s stream)
+        (progn
+          (write-char #\" stream)
+          (%emit-escaped s stream)
+          (write-char #\" stream)))))
+
+(defun %table-p (value)
+  (hash-table-p value))
+
+(defun %array-of-tables-p (value)
+  (and (vectorp value)
+       (not (stringp value))
+       (plusp (length value))
+       (every #'hash-table-p value)))
+
+(defun %frac-nanos (nano)
+  (if (zerop nano)
+      ""
+      (concatenate 'string "." (string-right-trim "0" (format nil "~9,'0d" nano)))))
+
+(defun %emit-datetime (value stream)
+  (cond
+    ((datetime-protocol:instantp value)
+     (write-string (datetime-protocol:print-rfc3339 value) stream))
+    ((datetime-protocol:zoned-moment-p value)
+     (write-string (datetime-protocol:print-rfc3339 value) stream))
+    ((datetime-protocol:momentp value)
+     (write-string
+      (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0d~a"
+              (datetime-protocol:date-year (datetime-protocol:moment-date value))
+              (datetime-protocol:date-month (datetime-protocol:moment-date value))
+              (datetime-protocol:date-day (datetime-protocol:moment-date value))
+              (datetime-protocol:time-of-day-hour (datetime-protocol:moment-time value))
+              (datetime-protocol:time-of-day-minute (datetime-protocol:moment-time value))
+              (datetime-protocol:time-of-day-second (datetime-protocol:moment-time value))
+              (%frac-nanos (datetime-protocol:time-of-day-nano (datetime-protocol:moment-time value))))
+      stream))
+    ((datetime-protocol:datep value)
+     (write-string
+      (format nil "~4,'0d-~2,'0d-~2,'0d"
+              (datetime-protocol:date-year value)
+              (datetime-protocol:date-month value)
+              (datetime-protocol:date-day value))
+      stream))
+    ((datetime-protocol:time-of-day-p value)
+     (write-string
+      (format nil "~2,'0d:~2,'0d:~2,'0d~a"
+              (datetime-protocol:time-of-day-hour value)
+              (datetime-protocol:time-of-day-minute value)
+              (datetime-protocol:time-of-day-second value)
+              (%frac-nanos (datetime-protocol:time-of-day-nano value)))
+      stream))
+    (t nil)))
+
+(defun %emit-scalar (value stream)
+  (cond
+    ((%emit-datetime value stream) t)
+    ((eq value t) (write-string "true" stream))
+    ((or (null value) (eq value :false)) (write-string "false" stream))
+    ((eq value :true) (write-string "true" stream))
+    ((stringp value)
+     (write-char #\" stream)
+     (%emit-escaped value stream)
+     (write-char #\" stream))
+    ((integerp value) (princ value stream))
+    ((floatp value) (let ((*read-default-float-format* 'double-float))
+                      (princ value stream)))
+    ((and (vectorp value) (not (stringp value)))
+     (write-char #\[ stream)
+     (loop for i from 0 below (length value)
+           for item = (aref value i)
+           do (when (plusp i) (write-string ", " stream))
+              (%emit-inline item stream))
+     (write-char #\] stream))
+    (t (error 'toml-encode-error
+              :message (format nil "cannot encode ~S as TOML" (type-of value))))))
+
+(defun %emit-inline-table (table stream)
+  (write-char #\{ stream)
+  (let ((first t))
+    (maphash (lambda (k v)
+               (unless first (write-string ", " stream))
+               (setf first nil)
+               (%emit-key k stream)
+               (write-string " = " stream)
+               (%emit-inline v stream))
+             table))
+  (write-char #\} stream))
+
+(defun %emit-inline (value stream)
+  (if (%table-p value)
+      (%emit-inline-table value stream)
+      (%emit-scalar value stream)))
+
+(defun %dotted (path)
+  (with-output-to-string (o)
+    (loop for i from 0
+          for key in path
+          do (when (plusp i) (write-char #\. o))
+             (%emit-key key o))))
+
+(defun %emit-table (table stream path)
+  (let ((scalars nil)
+        (tables nil)
+        (aots nil))
+    (maphash (lambda (k v)
+               (cond
+                 ((%array-of-tables-p v) (push (cons k v) aots))
+                 ((%table-p v) (push (cons k v) tables))
+                 (t (push (cons k v) scalars))))
+             table)
+    (setf scalars (nreverse scalars)
+          tables (nreverse tables)
+          aots (nreverse aots))
+    (when (and path (or scalars (and (null tables) (null aots))))
+      (format stream "[~A]~%" (%dotted path)))
+    (dolist (pair scalars)
+      (%emit-key (car pair) stream)
+      (write-string " = " stream)
+      (%emit-inline (cdr pair) stream)
+      (terpri stream))
+    (when (and scalars (or tables aots))
+      (terpri stream))
+    (dolist (pair tables)
+      (let ((child-path (append path (list (car pair)))))
+        (when (or path scalars)
+          (terpri stream))
+        (%emit-table (cdr pair) stream child-path)))
+    (dolist (pair aots)
+      (loop for item across (cdr pair)
+            do (format stream "[[~A]]~%"
+                       (%dotted (append path (list (car pair)))))
+               (%emit-table item stream nil)
+               (terpri stream)))))
+
+(defun emit-toml (value stream)
+  (cond
+    ((hash-table-p value)
+     (%emit-table value stream nil))
+    ((and (consp value) (every #'consp value))
+     (let ((ht (make-hash-table :test #'equal)))
+       (dolist (pair value)
+         (setf (gethash (if (stringp (car pair))
+                            (car pair)
+                            (string-downcase (string (car pair))))
+                        ht)
+               (cdr pair)))
+       (%emit-table ht stream nil)))
+    (t
+     (error 'toml-encode-error
+            :message "TOML encode wants a table (hash-table or alist)"))))
